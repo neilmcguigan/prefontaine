@@ -1,3 +1,116 @@
 #!/usr/bin/python3
 
-print('heyyy')
+"""
+A command to run a command, w secrets mgmt, db logging, retries
+
+who ran it
+what was run, cmd and opts, outcome
+when did it start and finish, duration
+where it run (cwd, hostname etc)
+why (who called it)
+
+get caller process, like cron:
+import psutil
+me = psutil.Process()
+print(me.cmdline())
+parent = psutil.Process(me.ppid())
+print(parent.cmdline())
+
+dox:
+https://docs.python.org/3.8/library/subprocess.html#module-subprocess
+https://realpython.com/python-subprocess/
+https://stackoverflow.com/questions/1051254/check-if-python-package-is-installed
+"""
+
+
+import os
+from dotenv import dotenv_values
+from pathlib import Path
+import sys
+import argparse
+import subprocess
+import boto3
+from time import time
+from datetime import datetime
+from platform import node
+
+from subprocess import CalledProcessError, SubprocessError, TimeoutExpired
+from datetime import datetime
+import backoff
+
+
+cfg = {
+    # sys config
+    **dotenv_values("/etc/prefontaine.env"),
+    # user config
+    **dotenv_values(Path.home() / ".prefontaine.env"),
+    # project config
+    **dotenv_values("prefontaine.env"),
+    # shell config
+    **{k: v for (k, v) in os.environ.items() if k.startswith("PRE_")}
+}
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-s", action="store_true")
+parser.add_argument("--timeout", type=int, default=cfg.get("PRE_TIMEOUT", 10))
+parser.add_argument("--retries", type=int, default=cfg.get("PRE_RETRIES", 3))
+parser.add_argument("command", nargs=argparse.REMAINDER)
+args = parser.parse_args()
+
+if not args.command:
+    args.command = ["echo", "hi"]
+    #print("error: the following arguments are required: command", file=sys.stderr)
+
+# print(args)
+# exit()
+
+environment = {}
+
+if args.s:
+    ssm = boto3.client("ssm")
+    response = ssm.get_parameters_by_path(
+        Path="/", Recursive=True, WithDecryption=True)
+    for p in response["Parameters"]:
+        name = p["Name"]
+        if name.startswith("/"):
+            name = name[1:]
+        name = name.replace("/", "_")
+        environment[name] = p["Value"]
+
+p = None
+try:
+    start = time()
+    p = subprocess.run(
+        args.command,
+        capture_output=True,
+        timeout=args.timeout,
+        #env={"FOO": "bar"},
+        env=environment,
+        text=True,
+        check=True
+    )
+    end = time()
+    duration = (end - start)
+
+    import sqlite3
+    from contextlib import closing
+    import json
+    from getpass import getuser
+    with closing(sqlite3.connect("prefontaine.db")) as con, con, closing(con.cursor()) as cursor:
+        cursor.execute("drop table if exists runs")
+        cursor.execute(
+            "create table if not exists runs(command text, args text, workdir, username, hostname, exit_code, duration_seconds, start, end, stdout, stderr)")
+        cursor.execute("insert into runs values (?,?,?,?,?,?,?,?,?,?,?)", [p.args[0], json.dumps(
+            p.args[1:]), os.getcwd(), getuser(),node(), p.returncode, duration, datetime.fromtimestamp(start), datetime.fromtimestamp(end), p.stdout, p.stderr])
+
+    print(p.stdout, file=sys.stdout, end="")
+    print(p.stderr, file=sys.stderr, end="")
+    exit(p.returncode)
+except (SubprocessError) as e:
+    # e.cmd, e.timeout if timeout, e.output, e.stderr, e.returncode if calledprocesserror
+    raise e
+except FileNotFoundError as e:
+    print(e.__dict__)
+    raise e
+finally:
+    pass
